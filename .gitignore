@@ -1,0 +1,4 @@
+.env
+diary.log
+__pycache__/
+*.pyc
