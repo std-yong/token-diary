@@ -13,7 +13,7 @@ Claude Code와 OpenAI Codex 사용량을 GitHub 잔디로 자동 시각화합니
 
 ```
 매일 밤 11:50 자동 실행
-→ ~/.claude/stats-cache.json 에서 Claude 토큰 사용량 읽기
+→ ~/.claude/projects/**/*.jsonl 에서 Claude 토큰 사용량 직접 읽기
 → ~/.codex/state_5.sqlite 에서 Codex 토큰 사용량 읽기
 → 지정한 폴더의 Claude 세션 내역 추출
 → Gemini API로 작업 내용 자동 요약
@@ -46,7 +46,7 @@ Claude Code와 OpenAI Codex 사용량을 GitHub 잔디로 자동 시각화합니
 ## 사전 준비
 
 - [Claude Code](https://claude.ai/code) 또는 [OpenAI Codex](https://openai.com/codex) 사용 중
-- Python 3.8+
+- Python 3.10+
 - GitHub 계정
 - Gemini API 키 (무료) — [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
 
@@ -114,7 +114,7 @@ python3 setup.py
 python3 diary.py --backfill
 ```
 
-`~/.claude/stats-cache.json` 및 `~/.codex/state_5.sqlite`의 과거 데이터를 소급 적용합니다
+`~/.claude/projects/**/*.jsonl` 및 `~/.codex/state_5.sqlite`의 과거 데이터를 소급 적용합니다
 
 ---
 
@@ -138,7 +138,7 @@ token-diary/             ← 잔디 레포 (별도 생성, 비공개 가능)
 
 ## 주의사항
 
-- `~/.claude/stats-cache.json`은 Claude Code 세션 종료 후 업데이트됩니다
+- Claude 토큰은 `~/.claude/projects/**/*.jsonl`에서 직접 읽어 세션 종료 여부와 무관하게 동작합니다
 - `~/.codex/state_5.sqlite`는 Codex CLI 사용 시 자동 생성됩니다
 - Mac 전용입니다 (Windows는 추후 지원 예정)
-- 맥북이 꺼져 있는 날은 다음 실행 시 당일 데이터만 반영됩니다
+- 맥북이 꺼져 있는 날은 다음 실행 시 `--backfill` 옵션으로 소급 적용됩니다

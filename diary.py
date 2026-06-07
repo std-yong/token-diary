@@ -3,10 +3,11 @@ import json
 import os
 import sqlite3
 import subprocess
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,7 +24,7 @@ WATCH_DIRS = [
 TODAY = datetime.now().strftime("%Y-%m-%d")
 CLAUDE_DIR = Path.home() / ".claude"
 REPO_DIR = Path(__file__).parent
-DIARY_REPO_DIR = Path.home() / "token-diary"
+DIARY_REPO_DIR = Path.home() / "my-token-diary"
 LOGS_DIR = DIARY_REPO_DIR / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
@@ -62,18 +63,55 @@ def fmt_tokens(n: int) -> str:
 
 
 def load_claude_stats(date: str):
-    stats_file = CLAUDE_DIR / "stats-cache.json"
-    if not stats_file.exists():
+    """JSONL 세션 파일에서 날짜별 토큰을 직접 읽는다. stats-cache.json 갱신 여부와 무관하게 동작."""
+    projects_dir = CLAUDE_DIR / "projects"
+    if not projects_dir.exists():
         return 0, {}
-    with open(stats_file) as f:
-        data = json.load(f)
-    tokens_entry = next(
-        (d for d in data.get("dailyModelTokens", []) if d["date"] == date), None
-    )
-    if not tokens_entry:
-        return 0, {}
-    total = sum(tokens_entry["tokensByModel"].values())
-    return total, tokens_entry["tokensByModel"]
+
+    model_tokens: dict[str, int] = defaultdict(int)
+
+    for proj in projects_dir.iterdir():
+        for jsonl_file in proj.glob("*.jsonl"):
+            try:
+                for line in jsonl_file.read_text(encoding="utf-8").splitlines():
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    ts = obj.get("timestamp", "")
+                    if not ts or ts[:10] != date:
+                        continue
+                    model = obj.get("message", {}).get("model", "")
+                    usage = obj.get("message", {}).get("usage", {})
+                    tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+                    if tokens > 0 and model:
+                        model_tokens[model] += tokens
+            except Exception:
+                continue
+
+    total = sum(model_tokens.values())
+    return total, dict(model_tokens)
+
+
+def collect_all_jsonl_dates() -> set[str]:
+    """JSONL 파일에 기록된 모든 날짜를 수집한다."""
+    projects_dir = CLAUDE_DIR / "projects"
+    if not projects_dir.exists():
+        return set()
+
+    dates: set[str] = set()
+    for proj in projects_dir.iterdir():
+        for jsonl_file in proj.glob("*.jsonl"):
+            try:
+                for line in jsonl_file.read_text(encoding="utf-8").splitlines():
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    ts = obj.get("timestamp", "")
+                    if ts and len(ts) >= 10:
+                        dates.add(ts[:10])
+            except Exception:
+                continue
+    return dates
 
 
 def load_codex_stats(date: str) -> int:
@@ -149,10 +187,12 @@ def summarize(messages: list[str]) -> str:
     if not messages or not GEMINI_API_KEY:
         return "- (작업 내역 없음)"
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        client = genai.Client(api_key=GEMINI_API_KEY)
         content = "\n\n".join(messages)
-        response = model.generate_content(PROMPT_TEMPLATE.format(session_content=content[:10000]))
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=PROMPT_TEMPLATE.format(session_content=content[:10000]),
+        )
         return response.text.strip()
     except Exception as e:
         return f"- (요약 실패: {e})"
@@ -235,7 +275,6 @@ def process_date(date: str, backfill: bool = False):
 
     git_commit(f"📅 {date} | {commit_label}", date)
 
-    # 추가 커밋: activity.log에 마커 추가
     activity_file = DIARY_REPO_DIR / "activity.log"
     for i in range(2, n_commits + 1):
         with open(activity_file, "a") as f:
@@ -246,15 +285,12 @@ def process_date(date: str, backfill: bool = False):
 
 
 def backfill():
-    stats_file = CLAUDE_DIR / "stats-cache.json"
     past_dates = set()
 
-    if stats_file.exists():
-        with open(stats_file) as f:
-            data = json.load(f)
-        for d in data.get("dailyModelTokens", []):
-            if d["date"] < TODAY:
-                past_dates.add(d["date"])
+    # JSONL에서 직접 날짜 수집 (stats-cache.json 불필요)
+    for date in collect_all_jsonl_dates():
+        if date < TODAY:
+            past_dates.add(date)
 
     # Codex 데이터에서도 날짜 수집
     db_path = Path.home() / ".codex" / "state_5.sqlite"
@@ -288,11 +324,9 @@ def main():
         print("❌ .env에 GITHUB_TOKEN, GITHUB_REPO가 필요합니다")
         return
 
-    # 소급 적용은 --backfill 옵션으로만 실행
     if "--backfill" in sys.argv:
         backfill()
 
-    # 오늘 처리
     process_date(TODAY)
 
     push()
