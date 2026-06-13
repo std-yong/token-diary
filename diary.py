@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import sqlite3
 import subprocess
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
 from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,17 +31,27 @@ DIARY_REPO_DIR = Path.home() / "my-token-diary"
 LOGS_DIR = DIARY_REPO_DIR / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
-PROMPT_TEMPLATE = """오늘 Claude Code와 함께 진행한 작업 내역이야.
-아래 대화 내용을 보고 핵심 작업을 3~5줄로 간결하게 요약해줘.
+SYSTEM_INSTRUCTION = """너는 개발자의 일일 작업 일기를 작성하는 어시스턴트야.
+사용자가 Claude Code/Codex와 나눈 대화 발췌와 메타데이터를 보고,
+그날 한 작업을 한국어 마크다운 불릿으로 압축 정리해.
 
-[규칙]
-- 한국어로 작성
-- 각 항목은 "- " 로 시작
-- 기술적인 내용 위주로, 잡담은 제외
-- 완료/진행 중 구분 불필요
+[원칙]
+- 기술 작업 중심. 잡담/메타 대화/AI에게 한 단순 요청은 제외
+- 각 불릿은 "- " 로 시작, 명사형 또는 동사 종결형 ("X 기능 구현", "Y 버그 수정")
+- 추측 금지: 대화에 나오지 않은 결과/완료 여부를 단정하지 말 것
+- 토큰량·모델 분포는 작업 규모 가늠 단서로만 활용하고, 요약 본문에 직접 언급하지 말 것
+- 출력은 불릿 3~5개만. 헤더·서론·맺음말 없이 불릿만 출력"""
 
-[오늘의 대화 내역]
-{session_content}"""
+USER_PROMPT = """[날짜] {date}
+[총 토큰] {total_tokens}
+[Claude 모델별 사용량] {model_breakdown}
+[Codex 토큰] {codex_tokens}
+[작업한 프로젝트] {projects}
+
+[사용자 메시지 발췌 (시간순, 일부 잘림)]
+{session_content}
+
+위 정보를 바탕으로 오늘 한 핵심 작업을 3~5개 불릿으로 요약해."""
 
 
 def tokens_to_commits(tokens: int) -> int:
@@ -183,19 +196,98 @@ def extract_session_messages(project_dir: Path, date: str) -> list[str]:
     return messages[:30]
 
 
-def summarize(messages: list[str]) -> str:
+def _parse_retry_delay(err_str: str):
+    m = re.search(r"'retryDelay':\s*'(\d+(?:\.\d+)?)s'", err_str)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"retry in ([\d.]+)s", err_str)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def _readable_project_names(project_dirs: list[Path]) -> list[str]:
+    names: set[str] = set()
+    for p in project_dirs:
+        for w in WATCH_DIRS:
+            prefix = str(w).replace("/", "-")
+            if p.name == prefix or p.name.startswith(prefix + "-"):
+                names.add(w.name)
+                break
+    return sorted(names)
+
+
+def _fallback_summary(claude_tokens: int, model_breakdown: dict, codex_tokens: int, projects: list[str]) -> str:
+    lines = []
+    if projects:
+        lines.append(f"- 작업 프로젝트: {', '.join(projects)}")
+    parts = []
+    if claude_tokens:
+        parts.append(f"Claude {fmt_tokens(claude_tokens)}")
+    if codex_tokens:
+        parts.append(f"Codex {fmt_tokens(codex_tokens)}")
+    if parts:
+        lines.append(f"- {' / '.join(parts)} 토큰 사용")
+    lines.append("- (AI 요약 미생성)")
+    return "\n".join(lines)
+
+
+def summarize(
+    messages: list[str],
+    *,
+    date: str,
+    claude_tokens: int,
+    model_breakdown: dict,
+    codex_tokens: int,
+    project_dirs: list[Path],
+) -> str:
+    projects = _readable_project_names(project_dirs)
     if not messages or not GEMINI_API_KEY:
+        if not GEMINI_API_KEY:
+            return _fallback_summary(claude_tokens, model_breakdown, codex_tokens, projects)
         return "- (작업 내역 없음)"
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        content = "\n\n".join(messages)
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=PROMPT_TEMPLATE.format(session_content=content[:10000]),
-        )
-        return response.text.strip()
-    except Exception as e:
-        return f"- (요약 실패: {e})"
+
+    model_str = ", ".join(
+        f"{m.replace('claude-','').replace('-20251001','').replace('-20250929','')} {fmt_tokens(v)}"
+        for m, v in model_breakdown.items()
+    ) or "없음"
+    content = "\n\n".join(messages)[:10000]
+    user_prompt = USER_PROMPT.format(
+        date=date,
+        total_tokens=fmt_tokens(claude_tokens + codex_tokens),
+        model_breakdown=model_str,
+        codex_tokens=fmt_tokens(codex_tokens) if codex_tokens else "0",
+        projects=", ".join(projects) if projects else "(미상)",
+        session_content=content,
+    )
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        temperature=0.3,
+    )
+
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=user_prompt,
+                config=config,
+            )
+            text = (response.text or "").strip()
+            return text or _fallback_summary(claude_tokens, model_breakdown, codex_tokens, projects)
+        except Exception as e:
+            err_str = str(e)
+            is_429 = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
+            if is_429 and attempt < max_attempts - 1:
+                delay = _parse_retry_delay(err_str) or (5 * (2 ** attempt))
+                delay = min(delay, 60)
+                print(f"[{date}] 429, {delay:.0f}s 대기 후 재시도 ({attempt+1}/{max_attempts})")
+                time.sleep(delay + 1)
+                continue
+            print(f"[{date}] 요약 실패: {err_str[:120]}")
+            return _fallback_summary(claude_tokens, model_breakdown, codex_tokens, projects)
 
 
 def write_diary(date: str, claude_tokens: int, model_breakdown: dict, codex_tokens: int, summary: str) -> Path:
@@ -264,7 +356,14 @@ def process_date(date: str, backfill: bool = False):
         all_messages = []
         for p in projects:
             all_messages.extend(extract_session_messages(p, date))
-        summary = summarize(all_messages)
+        summary = summarize(
+            all_messages,
+            date=date,
+            claude_tokens=claude_tokens,
+            model_breakdown=model_breakdown,
+            codex_tokens=codex_tokens,
+            project_dirs=projects,
+        )
 
     write_diary(date, claude_tokens, model_breakdown, codex_tokens, summary)
     n_commits = tokens_to_commits(total_tokens)
@@ -282,6 +381,47 @@ def process_date(date: str, backfill: bool = False):
         git_commit(f"📅 {date} [{i}/{n_commits}]", date)
 
     print(f"[{date}] Claude {fmt_tokens(claude_tokens)} + Codex {fmt_tokens(codex_tokens)} → {n_commits}커밋 ✅")
+
+
+def regenerate_broken() -> list[str]:
+    """깨진 AI 요약을 가진 기존 로그 파일을 다시 요약해서 덮어쓴다."""
+    broken_patterns = ("(요약 실패", "(작업 내역 없음)")
+    targets: list[str] = []
+    for log_file in sorted(LOGS_DIR.glob("*.md")):
+        text = log_file.read_text(encoding="utf-8")
+        if any(p in text for p in broken_patterns):
+            targets.append(log_file.stem)
+
+    if not targets:
+        print("재생성할 깨진 로그 없음")
+        return []
+
+    print(f"깨진 로그 {len(targets)}개 재생성: {', '.join(targets)}")
+    projects = find_today_projects()
+
+    regenerated: list[str] = []
+    for date in targets:
+        claude_tokens, model_breakdown = load_claude_stats(date)
+        codex_tokens = load_codex_stats(date)
+        all_messages: list[str] = []
+        for p in projects:
+            all_messages.extend(extract_session_messages(p, date))
+        all_messages = all_messages[:30]
+
+        summary = summarize(
+            all_messages,
+            date=date,
+            claude_tokens=claude_tokens,
+            model_breakdown=model_breakdown,
+            codex_tokens=codex_tokens,
+            project_dirs=projects,
+        )
+        write_diary(date, claude_tokens, model_breakdown, codex_tokens, summary)
+        regenerated.append(date)
+        print(f"[{date}] ✅ 재생성 완료")
+        time.sleep(2)  # 분당 호출 여유
+
+    return regenerated
 
 
 def backfill():
@@ -322,6 +462,19 @@ def main():
 
     if not GITHUB_TOKEN or not GITHUB_REPO:
         print("❌ .env에 GITHUB_TOKEN, GITHUB_REPO가 필요합니다")
+        return
+
+    if "--regenerate-broken" in sys.argv:
+        regen = regenerate_broken()
+        if regen:
+            env = os.environ.copy()
+            subprocess.run(["git", "add", "-A"], cwd=DIARY_REPO_DIR, check=True)
+            result = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=DIARY_REPO_DIR)
+            if result.returncode != 0:
+                msg = f"🔄 regenerate AI summaries ({len(regen)} days)"
+                subprocess.run(["git", "commit", "-m", msg], cwd=DIARY_REPO_DIR, env=env, check=True)
+        push()
+        print("✅ GitHub 푸시 완료")
         return
 
     if "--backfill" in sys.argv:
