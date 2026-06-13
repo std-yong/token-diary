@@ -18,9 +18,9 @@ load_dotenv()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-WATCH_DIRS = [
+EXCLUDE_DIRS = [
     Path(d.strip().replace("~", str(Path.home())))
-    for d in os.getenv("WATCH_DIRS", "").split(",")
+    for d in os.getenv("EXCLUDE_DIRS", "").split(",")
     if d.strip()
 ]
 
@@ -146,17 +146,38 @@ def load_codex_stats(date: str) -> int:
         return 0
 
 
-def find_today_projects() -> list[Path]:
+def find_active_projects(date: str) -> list[Path]:
+    """date에 user 메시지가 하나라도 있는 모든 프로젝트. EXCLUDE_DIRS는 제외."""
     projects_dir = CLAUDE_DIR / "projects"
     if not projects_dir.exists():
         return []
-    matched = []
-    for watch_dir in WATCH_DIRS:
-        prefix = str(watch_dir).replace("/", "-")
-        for project_dir in projects_dir.iterdir():
-            if project_dir.name == prefix or project_dir.name.startswith(prefix + "-"):
-                matched.append(project_dir)
-    return matched
+
+    exclude_prefixes = [str(d).replace("/", "-") for d in EXCLUDE_DIRS]
+
+    active: list[Path] = []
+    for proj in projects_dir.iterdir():
+        if any(proj.name == p or proj.name.startswith(p + "-") for p in exclude_prefixes):
+            continue
+        found = False
+        for jsonl in proj.glob("*.jsonl"):
+            if found:
+                break
+            try:
+                for line in jsonl.read_text(encoding="utf-8").splitlines():
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = obj.get("timestamp", "")
+                    if ts[:10] == date and obj.get("type") == "user":
+                        active.append(proj)
+                        found = True
+                        break
+            except Exception:
+                continue
+    return active
 
 
 def extract_session_messages(project_dir: Path, date: str) -> list[str]:
@@ -165,17 +186,13 @@ def extract_session_messages(project_dir: Path, date: str) -> list[str]:
 
     for jsonl_file in project_dir.glob("*.jsonl"):
         try:
-            lines = jsonl_file.read_text(encoding="utf-8").splitlines()
-            is_today = False
-            for line in lines:
+            for line in jsonl_file.read_text(encoding="utf-8").splitlines():
                 try:
                     obj = json.loads(line)
                 except Exception:
                     continue
-                ts = obj.get("snapshot", {}).get("timestamp", "")
-                if ts and ts[:10] == date:
-                    is_today = True
-                if not is_today:
+                ts = obj.get("timestamp", "")
+                if not ts or ts[:10] != date:
                     continue
                 if obj.get("type") != "user":
                     continue
@@ -207,14 +224,18 @@ def _parse_retry_delay(err_str: str):
 
 
 def _readable_project_names(project_dirs: list[Path]) -> list[str]:
-    names: set[str] = set()
+    """프로젝트 디렉토리명에서 home prefix 제거한 짧은 이름."""
+    home_prefix = str(Path.home()).replace("/", "-") + "-"
+    names: list[str] = []
+    seen: set[str] = set()
     for p in project_dirs:
-        for w in WATCH_DIRS:
-            prefix = str(w).replace("/", "-")
-            if p.name == prefix or p.name.startswith(prefix + "-"):
-                names.add(w.name)
-                break
-    return sorted(names)
+        name = p.name
+        if name.startswith(home_prefix):
+            name = name[len(home_prefix):]
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
 
 
 def _fallback_summary(claude_tokens: int, model_breakdown: dict, codex_tokens: int, projects: list[str]) -> str:
@@ -349,13 +370,14 @@ def process_date(date: str, backfill: bool = False):
         print(f"[{date}] 토큰 데이터 없음, 스킵")
         return
 
-    if backfill:
+    projects = find_active_projects(date)
+    all_messages = []
+    for p in projects:
+        all_messages.extend(extract_session_messages(p, date))
+
+    if backfill and not all_messages:
         summary = f"- Claude {fmt_tokens(claude_tokens)} / Codex {fmt_tokens(codex_tokens)} 토큰 사용 (상세 내역 없음)"
     else:
-        projects = find_today_projects()
-        all_messages = []
-        for p in projects:
-            all_messages.extend(extract_session_messages(p, date))
         summary = summarize(
             all_messages,
             date=date,
@@ -384,8 +406,8 @@ def process_date(date: str, backfill: bool = False):
 
 
 def regenerate_broken() -> list[str]:
-    """깨진 AI 요약을 가진 기존 로그 파일을 다시 요약해서 덮어쓴다."""
-    broken_patterns = ("(요약 실패", "(작업 내역 없음)")
+    """깨진/미요약 AI 요약을 가진 기존 로그 파일을 다시 요약해서 덮어쓴다."""
+    broken_patterns = ("(요약 실패", "(작업 내역 없음)", "(상세 내역 없음)")
     targets: list[str] = []
     for log_file in sorted(LOGS_DIR.glob("*.md")):
         text = log_file.read_text(encoding="utf-8")
@@ -396,17 +418,23 @@ def regenerate_broken() -> list[str]:
         print("재생성할 깨진 로그 없음")
         return []
 
-    print(f"깨진 로그 {len(targets)}개 재생성: {', '.join(targets)}")
-    projects = find_today_projects()
+    print(f"재요약 후보 {len(targets)}개 검사: {', '.join(targets)}")
 
     regenerated: list[str] = []
     for date in targets:
         claude_tokens, model_breakdown = load_claude_stats(date)
         codex_tokens = load_codex_stats(date)
+        projects = find_active_projects(date)
         all_messages: list[str] = []
         for p in projects:
             all_messages.extend(extract_session_messages(p, date))
         all_messages = all_messages[:30]
+
+        if not all_messages:
+            current = (LOGS_DIR / f"{date}.md").read_text(encoding="utf-8")
+            if "(요약 실패" not in current:
+                print(f"[{date}] 메시지 추출 불가, 스킵")
+                continue
 
         summary = summarize(
             all_messages,
@@ -418,7 +446,7 @@ def regenerate_broken() -> list[str]:
         )
         write_diary(date, claude_tokens, model_breakdown, codex_tokens, summary)
         regenerated.append(date)
-        print(f"[{date}] ✅ 재생성 완료")
+        print(f"[{date}] ✅ 재생성 완료 (메시지 {len(all_messages)}개)")
         time.sleep(2)  # 분당 호출 여유
 
     return regenerated
