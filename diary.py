@@ -311,6 +311,33 @@ def summarize(
             return _fallback_summary(claude_tokens, model_breakdown, codex_tokens, projects)
 
 
+def update_logs_index() -> Path:
+    """logs/README.md 를 최신순 일기 인덱스로 갱신."""
+    log_files = sorted(
+        (f for f in LOGS_DIR.glob("*.md") if f.name != "README.md"),
+        key=lambda f: f.stem,
+        reverse=True,
+    )
+    total_re = re.compile(r"\|\s*총 토큰\s*\|\s*(\S+)\s*\|")
+    commits_re = re.compile(r"\|\s*커밋 수\s*\|\s*(\S+)\s*\|")
+
+    lines = ["# 일기 인덱스", "", f"총 {len(log_files)}일. 최신순.", "", "| 날짜 | 토큰 | 커밋 |", "|---|---|---|"]
+    for f in log_files:
+        try:
+            text = f.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        tm = total_re.search(text)
+        cm = commits_re.search(text)
+        total = tm.group(1) if tm else "-"
+        commits = cm.group(1) if cm else "-"
+        lines.append(f"| [{f.stem}](./{f.name}) | {total} | {commits} |")
+
+    readme = LOGS_DIR / "README.md"
+    readme.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return readme
+
+
 def write_diary(date: str, claude_tokens: int, model_breakdown: dict, codex_tokens: int, summary: str) -> Path:
     total_tokens = claude_tokens + codex_tokens
     n_commits = tokens_to_commits(total_tokens)
@@ -341,6 +368,7 @@ def write_diary(date: str, claude_tokens: int, model_breakdown: dict, codex_toke
 """
     log_file = LOGS_DIR / f"{date}.md"
     log_file.write_text(content, encoding="utf-8")
+    update_logs_index()
     return log_file
 
 
@@ -407,7 +435,7 @@ def process_date(date: str, backfill: bool = False):
 
 def regenerate_broken() -> list[str]:
     """깨진/미요약 AI 요약을 가진 기존 로그 파일을 다시 요약해서 덮어쓴다."""
-    broken_patterns = ("(요약 실패", "(작업 내역 없음)", "(상세 내역 없음)")
+    broken_patterns = ("(요약 실패", "(작업 내역 없음)", "(상세 내역 없음)", "AI 요약 미생성")
     targets: list[str] = []
     for log_file in sorted(LOGS_DIR.glob("*.md")):
         text = log_file.read_text(encoding="utf-8")
@@ -446,8 +474,11 @@ def regenerate_broken() -> list[str]:
         )
         write_diary(date, claude_tokens, model_breakdown, codex_tokens, summary)
         regenerated.append(date)
-        print(f"[{date}] ✅ 재생성 완료 (메시지 {len(all_messages)}개)")
-        time.sleep(2)  # 분당 호출 여유
+        if "AI 요약 미생성" in summary:
+            print(f"[{date}] ⚠️ fallback 사용 (메시지 {len(all_messages)}개)")
+        else:
+            print(f"[{date}] ✅ 재생성 완료 (메시지 {len(all_messages)}개)")
+        time.sleep(5)  # 분당 호출 여유 (RPM 한도 회피)
 
     return regenerated
 
